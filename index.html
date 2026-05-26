@@ -141,8 +141,10 @@ function installPWA(){
         patients:     db.patients,
         staffList: db.staffList||[],
         prescriptions: db.prescriptions||[],
+        expenses: db.expenses||[],
         updatedAt: new Date().toISOString()
       });
+      document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
     } catch(e) {
       console.warn("Firestore save failed:", e.message);
       document.getElementById('db-status').textContent = '🔴 Sync Error';
@@ -160,6 +162,11 @@ function installPWA(){
         if (data.patients     && data.patients.length)     db.patients     = data.patients;
         if (data.staffList && data.staffList.length)  db.staffList = data.staffList;
         if (data.prescriptions && data.prescriptions.length)  db.prescriptions = data.prescriptions;
+        if (data.expenses && data.expenses.length)  db.expenses = data.expenses;
+      } else {
+        // First-time: no cloud data yet — seed demo data and save it up
+        seedData();
+        saveToFirestore();
       }
       document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
     } catch(e) {
@@ -2674,7 +2681,7 @@ function seedData(){
     }
   ];
 }
-seedData();
+// seedData() only called as fallback when Firestore has no data (see loadFromFirestore)
 
 // ══════════════════════════════════════════
 // UTILS
