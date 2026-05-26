@@ -133,49 +133,85 @@ function installPWA(){
     window._initAuthWatcher();
   });
 
+  // ── Unsubscribe handle (kept for cleanup on logout) ──
+  window._dbUnsub = null;
+
+  // ── Apply cloud data into db and re-render ──
+  function _applySnapshot(data) {
+    db.suppliers     = Array.isArray(data.suppliers)     ? data.suppliers     : [];
+    db.medicines     = Array.isArray(data.medicines)     ? data.medicines     : (Array.isArray(data.products) ? data.products : []);
+    db.patients      = Array.isArray(data.patients)      ? data.patients      : [];
+    db.staffList     = Array.isArray(data.staffList)     ? data.staffList     : [];
+    db.prescriptions = Array.isArray(data.prescriptions) ? data.prescriptions : [];
+    db.expenses      = Array.isArray(data.expenses)      ? data.expenses      : [];
+
+    const now = new Date();
+    const chartMonthEl = document.getElementById('chartMonth');
+    if (chartMonthEl && !chartMonthEl.value)
+      chartMonthEl.value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+
+    if (typeof renderDash     === 'function') renderDash();
+    if (typeof renderComps    === 'function') renderComps();
+    if (typeof renderPatients === 'function') renderPatients();
+    if (typeof renderStaffTab === 'function') renderStaffTab();
+    if (typeof renderPoList   === 'function') renderPoList();
+
+    document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
+  }
+
+  // ── Save — plain async write, no debounce, no guards ──
   window.saveToFirestore = async function() {
+    if (!window._currentUser) return; // not logged in, skip
     try {
       await _db.collection("medicare").doc("maindb").set({
-        suppliers: db.suppliers,
-        medicines:  db.medicines,
-        patients:     db.patients,
-        staffList: db.staffList||[],
-        prescriptions: db.prescriptions||[],
-        expenses: db.expenses||[],
-        updatedAt: new Date().toISOString()
+        suppliers:     db.suppliers,
+        medicines:     db.medicines,
+        patients:      db.patients,
+        staffList:     db.staffList     || [],
+        prescriptions: db.prescriptions || [],
+        expenses:      db.expenses      || [],
+        updatedAt:     new Date().toISOString()
       });
       document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
     } catch(e) {
-      console.warn("Firestore save failed:", e.message);
+      console.error("Firestore save failed:", e);
       document.getElementById('db-status').textContent = '🔴 Sync Error';
+      if (typeof toast === 'function') toast('❌ Save failed: ' + e.message, 'err');
     }
   };
 
+  // ── Load — plain one-time .get(), always reads fresh from server ──
   window.loadFromFirestore = async function() {
+    document.getElementById('db-status').textContent = '🔄 Loading…';
     try {
-      const snap = await _db.collection("medicare").doc("maindb").get();
+      // Force server read — bypass any local cache
+      const snap = await _db.collection("medicare").doc("maindb").get({ source: 'server' });
       if (snap.exists) {
-        const data = snap.data();
-        if (data.suppliers && data.suppliers.length) db.suppliers = data.suppliers;
-        if (data.medicines && data.medicines.length)  db.medicines  = data.medicines;
-        else if (data.products && data.products.length) db.medicines = data.products; // legacy
-        if (data.patients     && data.patients.length)     db.patients     = data.patients;
-        if (data.staffList && data.staffList.length)  db.staffList = data.staffList;
-        if (data.prescriptions && data.prescriptions.length)  db.prescriptions = data.prescriptions;
-        if (data.expenses && data.expenses.length)  db.expenses = data.expenses;
+        _applySnapshot(snap.data());
       } else {
-        // First-time: no cloud data yet — seed demo data and save it up
+        // First ever launch — push seed data
         seedData();
-        saveToFirestore();
+        await saveToFirestore();
       }
-      document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
     } catch(e) {
-      console.warn("Firestore load failed:", e.message);
-      document.getElementById('db-status').textContent = '🔴 DB Error: ' + e.code;
+      console.error("Firestore load failed:", e);
+      document.getElementById('db-status').textContent = '🔴 Load Error: ' + e.message;
+      // Try cache as fallback
+      try {
+        const snap2 = await _db.collection("medicare").doc("maindb").get({ source: 'cache' });
+        if (snap2.exists) {
+          _applySnapshot(snap2.data());
+          document.getElementById('db-status').textContent = '🟡 Offline (cached data)';
+        }
+      } catch(e2) { console.warn("Cache fallback also failed:", e2); }
     }
-    const now = new Date();
-    document.getElementById('chartMonth').value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-    renderDash(); renderComps(); renderPatients(); renderStaffTab(); renderPoList();
+  };
+
+  // ── Stop listener on logout ──
+  window.doLogout = async function() {
+    if (window._dbUnsub) { window._dbUnsub(); window._dbUnsub = null; }
+    await _auth.signOut();
+    showLoginPage();
   };
 </script>
 <style>
@@ -1985,7 +2021,7 @@ tbody tr:hover{background:var(--glass-bg-h);transform:translateX(2px)}
   <div class="glass">
     <div class="sec-hdr">
       <div class="sec-title">☁️ Cloud Database Info</div>
-      <button class="btn btn-ghost btn-sm" onclick="loadFromFirestore().then(()=>renderBackupCloudInfo())">🔄 Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="loadFromFirestore();setTimeout(()=>renderBackupCloudInfo(),1500)">🔄 Refresh</button>
     </div>
     <div id="backupCloudInfo">
       <div style="font-size:.82rem;color:var(--text3)">Loading cloud info…</div>
@@ -5209,7 +5245,7 @@ function saveBill(){
     payMethod:selPayMethod,
     balance:finalBalance,
     discount:discountInfo,
-    dispensedCharge:dispensedCharge>0?dispensedCharge:undefined,
+    dispensedCharge:dispensedCharge>0?dispensedCharge:0,
     notes:billNotes||'',
     payments:paid>0?[{id:uid(),date:saleDate,amount:paid,method:selPayMethod}]:[]
   };
@@ -8993,120 +9029,6 @@ function shareOnWhatsApp(patientId, sessId) {
   window.open(url, '_blank');
   logActivity(`💬 WhatsApp bill shared for ${sh.name}`);
 }
-
-// ══════════════════════════════════════════
-// CONSOLIDATED Firestore Save (with expenses + offline queue)
-// ══════════════════════════════════════════
-window.saveToFirestore = async function() {
-  // Always save to localStorage as fallback
-  try {
-    localStorage.setItem('medicalBillingDB', JSON.stringify({
-      suppliers: db.suppliers,
-      medicines: db.medicines,
-      patients: db.patients,
-      staffList: db.staffList || [],
-      prescriptions: db.prescriptions || [],
-      expenses: db.expenses || [],
-      updatedAt: new Date().toISOString()
-    }));
-  } catch(e) { console.warn("localStorage save failed:", e); }
-
-  if (!_isOnline) {
-    _offlineQueue.push(Date.now());
-    document.getElementById('db-status').textContent = '🟠 Queued (offline)';
-    return;
-  }
-  // Don't attempt Firestore write if user is not authenticated
-  if (!window._currentUser) {
-    console.warn("saveToFirestore: no authenticated user, skipping Firestore write");
-    document.getElementById('db-status').textContent = '🔴 Not Logged In';
-    _offlineQueue.push(Date.now()); // will retry after auth
-    return;
-  }
-  try {
-    await _db.collection("medicare").doc("maindb").set({
-      suppliers: db.suppliers,
-      medicines:  db.medicines,
-      patients:     db.patients,
-      staffList: db.staffList || [],
-      prescriptions: db.prescriptions || [],
-      expenses:  db.expenses  || [],
-      updatedAt: new Date().toISOString()
-    });
-    document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
-  } catch(e) {
-    console.warn("Firestore save failed:", e.message);
-    _offlineQueue.push(Date.now()); // queue for retry
-    document.getElementById('db-status').textContent = '🔴 Sync Error — will retry';
-  }
-};
-
-// ══════════════════════════════════════════
-// CONSOLIDATED Firestore Load (with expenses + notifications)
-// ══════════════════════════════════════════
-window.loadFromFirestore = async function() {
-  // Always read localStorage first so we have a fallback with its timestamp
-  let localData = null;
-  try {
-    const raw = localStorage.getItem('medicalBillingDB');
-    if (raw) localData = JSON.parse(raw);
-  } catch(le) { console.warn("localStorage read failed:", le); }
-
-  try {
-    const snap = await _db.collection("medicare").doc("maindb").get();
-    if (snap.exists) {
-      const cloudData = snap.data();
-      // Use whichever copy is newer — prevents a stale cloud record from
-      // overwriting a bill that was saved locally but whose Firestore write failed
-      const cloudTime = cloudData.updatedAt ? new Date(cloudData.updatedAt).getTime() : 0;
-      const localTime = localData && localData.updatedAt ? new Date(localData.updatedAt).getTime() : 0;
-      const data = cloudTime >= localTime ? cloudData : localData;
-      if (cloudTime < localTime) {
-        // Local is newer — push it up to cloud now to repair the gap
-        console.warn("loadFromFirestore: local data is newer than cloud, repairing...");
-        saveToFirestore();
-      }
-      if (data.suppliers && data.suppliers.length) db.suppliers = data.suppliers;
-      if (data.medicines && data.medicines.length)  db.medicines  = data.medicines;
-        else if (data.products && data.products.length) db.medicines = data.products; // legacy
-      if (data.patients     && data.patients.length)     db.patients     = data.patients;
-      if (data.staffList && data.staffList.length) db.staffList = data.staffList;
-      if (data.prescriptions && data.prescriptions.length) db.prescriptions = data.prescriptions;
-      if (data.expenses  && data.expenses.length)  db.expenses  = data.expenses;
-    } else if (localData) {
-      // No cloud document at all — load from local and push up
-      if (localData.suppliers && localData.suppliers.length) db.suppliers = localData.suppliers;
-      if (localData.medicines && localData.medicines.length)  db.medicines  = localData.medicines;
-      if (localData.patients  && localData.patients.length)   db.patients   = localData.patients;
-      if (localData.staffList && localData.staffList.length)  db.staffList  = localData.staffList;
-      if (localData.prescriptions && localData.prescriptions.length) db.prescriptions = localData.prescriptions;
-      if (localData.expenses  && localData.expenses.length)   db.expenses   = localData.expenses;
-      saveToFirestore();
-    }
-    document.getElementById('db-status').textContent = '🟢 Cloud Sync ON';
-  } catch(e) {
-    console.warn("Firestore load failed:", e.message);
-    document.getElementById('db-status').textContent = '🔴 DB Error: ' + (e.code||e.message);
-    // Fallback: load from localStorage
-    if (localData) {
-      try {
-        if (localData.suppliers && localData.suppliers.length) db.suppliers = localData.suppliers;
-        if (localData.medicines && localData.medicines.length)  db.medicines  = localData.medicines;
-        if (localData.patients  && localData.patients.length)   db.patients   = localData.patients;
-        if (localData.staffList && localData.staffList.length)  db.staffList  = localData.staffList;
-        if (localData.prescriptions && localData.prescriptions.length) db.prescriptions = localData.prescriptions;
-        if (localData.expenses  && localData.expenses.length)   db.expenses   = localData.expenses;
-        document.getElementById('db-status').textContent = '🟡 Local Data (Firebase offline)';
-      } catch(le) { console.warn("localStorage load failed:", le); }
-    }
-  }
-  const now = new Date();
-  document.getElementById('chartMonth').value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-  const cfYear = document.getElementById('cashflowYear');
-  if (cfYear) cfYear.value = now.getFullYear();
-  renderDash(); renderComps(); renderPatients(); renderStaffTab(); renderPoList();
-  setTimeout(checkAllNotifications, 1500);
-};
 
 function openReturnDmgInfoModal(){ openM('mReturnDmgInfo'); }
 
